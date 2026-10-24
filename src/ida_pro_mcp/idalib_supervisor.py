@@ -23,7 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock, Thread
 from typing import Annotated, Any, TypedDict
 
 
@@ -95,6 +95,18 @@ PARTIAL_DATABASE_EXTENSIONS = (".id0", ".id1", ".id2", ".nam", ".til")
 # Set IDA_MCP_OPEN_TIMEOUT=0 to wait indefinitely (previous behavior).
 WORKER_OPEN_TIMEOUT_SEC = _env_float("IDA_MCP_OPEN_TIMEOUT", 1800.0)
 
+# idb_open waits this long for the open to finish, then returns the session ID
+# with pending=true while analysis carries on in the background. MCP clients
+# time out long requests (about 60s in Claude Code), and a timed-out open used
+# to leave a worker holding the database lock with no usable session ID.
+# 0 waits for the open to finish, however long it takes.
+OPEN_WAIT_SEC = _env_float("IDA_MCP_OPEN_WAIT", 20.0)
+
+# Idle time before a headless worker exits. Two hours, so a session survives
+# long breaks between IDA calls (in-game testing). 0 disables the timeout.
+def _default_idle_ttl() -> int:
+    return _env_int("IDA_MCP_IDLE_TIMEOUT", 7200)
+
 
 def _import_zeromcp():
     """Import vendored zeromcp without importing ida_mcp/__init__.py."""
@@ -157,6 +169,7 @@ class IdalibSessionListInfo(IdalibSessionInfo, total=False):
 
 class IdalibOpenResult(TypedDict, total=False):
     success: bool
+    pending: bool
     session: IdalibSessionInfo
     warmup: dict[str, Any] | None
     message: str
@@ -230,6 +243,40 @@ class WorkerSession:
         return self.process is not None and self.process.poll() is None
 
 
+@dataclass
+class PendingOpen:
+    """An idb_open still running (or finished but not yet reported)."""
+
+    session_id: str
+    input_path: str
+    path_key: str
+    started: float = field(default_factory=time.monotonic)
+    done: Event = field(default_factory=Event)
+    session: WorkerSession | None = None
+    error: str | None = None
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    def to_list_dict(self) -> IdalibSessionListInfo:
+        return {
+            "session_id": self.session_id,
+            "input_path": self.input_path,
+            "filename": Path(self.input_path).name,
+            "created_at": "",
+            "last_accessed": "",
+            "is_analyzing": True,
+            "metadata": {"pending": True, "elapsed_sec": round(self.elapsed())},
+            "is_active": True,
+            "busy": True,
+            "backend": "worker",
+            "owned": True,
+            "adopted": False,
+            "pid": None,
+            "worker_pid": None,
+        }
+
+
 class IdalibSupervisor:
     def __init__(
         self,
@@ -246,6 +293,7 @@ class IdalibSupervisor:
         self._schema_worker: WorkerSession | None = None
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
+        self._pending: dict[str, PendingOpen] = {}
         self._lock = RLock()
 
     # ------------------------------------------------------------------
@@ -419,7 +467,7 @@ class IdalibSupervisor:
             if stale is not None:
                 self._terminate_worker(stale)
 
-    def _allocate_worker_locked(self) -> WorkerSession:
+    def _allocate_worker_locked(self, for_session_id: str | None = None) -> WorkerSession:
         worker = self._take_schema_worker_for_session()
         if worker is not None:
             return worker
@@ -429,6 +477,12 @@ class IdalibSupervisor:
             1
             for session in self.sessions.values()
             if session.backend == "worker" and session.owned and session.is_alive()
+        )
+        # Other opens still analyzing hold a worker that isn't registered yet.
+        owned_workers += sum(
+            1
+            for p in self._pending.values()
+            if not p.done.is_set() and p.session_id != for_session_id
         )
         if self.max_workers <= 0 or owned_workers < self.max_workers:
             return self._spawn_worker()
@@ -825,13 +879,15 @@ class IdalibSupervisor:
         run_auto_analysis: bool = True,
         build_caches: bool = True,
         init_hexrays: bool = True,
-        idle_ttl_sec: int = 600,
+        idle_ttl_sec: int | None = None,
         session_id: str | None = None,
     ) -> WorkerSession:
         if mode not in IDB_OPEN_MODES:
             raise ValueError(
                 f"Unknown mode: {mode!r}. Expected one of: {sorted(IDB_OPEN_MODES)}."
             )
+        if idle_ttl_sec is None:
+            idle_ttl_sec = _default_idle_ttl()
         resolved = self._normalize_input_path(input_path)
         with self._lock:
             existing = self.path_to_session.get(self._path_key(resolved))
@@ -877,7 +933,7 @@ class IdalibSupervisor:
                         return adopted
 
             if not break_for_launch:
-                worker = self._allocate_worker_locked()
+                worker = self._allocate_worker_locked(session_id)
 
         if break_for_launch:
             return self._launch_gui_and_adopt(resolved, session_id)
@@ -1109,6 +1165,80 @@ class IdalibSupervisor:
             session.last_accessed = datetime.now()
             return session
 
+    # ------------------------------------------------------------------
+    # Background opens
+    # ------------------------------------------------------------------
+
+    def start_open(
+        self, input_path: str, *, session_id: str | None, **open_kwargs: Any
+    ) -> PendingOpen:
+        """Run open_session on a thread. Reuses an open already running for the path."""
+        resolved = self._normalize_input_path(input_path)
+        key = self._path_key(resolved)
+        with self._lock:
+            for pending in list(self._pending.values()):
+                if pending.path_key != key:
+                    continue
+                if not pending.done.is_set():
+                    return pending
+                # Finished earlier: start over, since that session may have
+                # been closed since. open_session reuses a live one.
+                del self._pending[pending.session_id]
+            if session_id and session_id in self._pending:
+                raise ValueError(
+                    f"Session {session_id!r} is still opening "
+                    f"{self._pending[session_id].input_path}"
+                )
+            pending = PendingOpen(
+                session_id=session_id or str(uuid.uuid4())[:8],
+                input_path=resolved,
+                path_key=key,
+            )
+            self._pending[pending.session_id] = pending
+
+        def run() -> None:
+            try:
+                pending.session = self.open_session(
+                    resolved, session_id=pending.session_id, **open_kwargs
+                )
+            except Exception as e:
+                logger.warning("Background open of %s failed: %s", resolved, e)
+                pending.error = str(e) or type(e).__name__
+            finally:
+                pending.done.set()
+
+        Thread(target=run, name=f"idb_open-{pending.session_id}", daemon=True).start()
+        return pending
+
+    def find_pending(self, database: str) -> PendingOpen | None:
+        with self._lock:
+            return self._pending.get(database)
+
+    def forget_pending(self, pending: PendingOpen) -> None:
+        """Drop a finished open once its result has been reported."""
+        with self._lock:
+            if self._pending.get(pending.session_id) is pending and pending.done.is_set():
+                del self._pending[pending.session_id]
+
+    def pending_list_entries(self) -> list[IdalibSessionListInfo]:
+        with self._lock:
+            pendings = list(self._pending.values())
+        entries: list[IdalibSessionListInfo] = []
+        for pending in pendings:
+            if not pending.done.is_set():
+                entries.append(pending.to_list_dict())
+            elif pending.error is not None:
+                entry = pending.to_list_dict()
+                entry["is_analyzing"] = False
+                entry["is_active"] = False
+                entry["busy"] = False
+                entry["metadata"]["open_error"] = pending.error
+                entries.append(entry)
+                self.forget_pending(pending)
+            else:
+                self.forget_pending(pending)
+        return entries
+
     def close_session(self, database: str, *, save: bool = True) -> IdalibCloseResult:
         """Save (optionally), unregister, and terminate a session's owned worker.
 
@@ -1314,32 +1444,61 @@ def idb_open(
     init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler after open"] = True,
     idle_ttl_sec: Annotated[
         int,
-        "Minimum idle TTL in seconds before the headless worker self-exits (0 disables the timeout).",
-    ] = 600,
+        "Minimum idle TTL in seconds before the headless worker self-exits "
+        "(0 disables the timeout; default from IDA_MCP_IDLE_TIMEOUT, else 7200).",
+    ] = -1,
     preferred_session_id: Annotated[
         str, "Preferred session ID (auto-generated if empty). Ignored if the file is already open in a GUI or worker session."
     ] = "",
 ) -> IdalibOpenResult:
-    """Open a binary and warm it up. Returns the existing session if the file is already open under the supervisor; otherwise creates one according to `mode`."""
+    """Open a binary and warm it up. Returns the existing session if the file is already open under the supervisor; otherwise creates one according to `mode`.
+
+    A long first analysis does not block: after a short wait the result has
+    pending=true and the session ID while analysis continues. Call idb_open
+    again with the same path (or idb_list) to see when it is ready; tool calls
+    on a pending session return a "still analyzing" error until then.
+    """
     sup = _require_supervisor()
     try:
-        session = sup.open_session(
+        pending = sup.start_open(
             input_path,
+            session_id=preferred_session_id or None,
             mode=mode,
             run_auto_analysis=run_auto_analysis,
             build_caches=build_caches,
             init_hexrays=init_hexrays,
-            idle_ttl_sec=idle_ttl_sec,
-            session_id=preferred_session_id or None,
+            idle_ttl_sec=None if idle_ttl_sec < 0 else idle_ttl_sec,
         )
-        return {
-            "success": True,
-            "session": session.to_dict(),
-            "warmup": session.last_warmup,
-            "message": f"Binary opened: {session.filename} ({session.session_id})",
-        }
+        pending.done.wait(OPEN_WAIT_SEC if OPEN_WAIT_SEC > 0 else None)
+        return _pending_open_result(sup, pending)
     except Exception as e:
         return {"error": str(e)}
+
+
+def _pending_open_result(sup: IdalibSupervisor, pending: PendingOpen) -> IdalibOpenResult:
+    if not pending.done.is_set():
+        return {
+            "success": True,
+            "pending": True,
+            "session": pending.to_list_dict(),
+            "message": (
+                f"Still opening and analyzing {Path(pending.input_path).name} "
+                f"({round(pending.elapsed())}s so far) as session "
+                f"'{pending.session_id}'. Call idb_open with the same path or "
+                f"idb_list to check; tool calls work once it is ready."
+            ),
+        }
+    sup.forget_pending(pending)
+    if pending.error is not None:
+        return {"error": pending.error}
+    session = pending.session
+    assert session is not None
+    return {
+        "success": True,
+        "session": session.to_dict(),
+        "warmup": session.last_warmup,
+        "message": f"Binary opened: {session.filename} ({session.session_id})",
+    }
 
 
 @mcp.tool
@@ -1347,7 +1506,7 @@ def idb_list() -> IdalibListResult:
     """List adopted sessions and discovered GUI/worker instances not yet opened through idb_open."""
     sup = _require_supervisor()
     try:
-        sessions = sup.list_sessions()
+        sessions = sup.list_sessions() + sup.pending_list_entries()
         return {"sessions": sessions, "count": len(sessions)}
     except Exception as e:
         return {"error": f"Failed to list sessions: {e}"}
@@ -1365,6 +1524,15 @@ def idb_close(
     """
     sup = _require_supervisor()
     try:
+        pending = sup.find_pending(database)
+        if pending is not None and not pending.done.is_set():
+            return {
+                "error": (
+                    f"Session '{database}' is still opening "
+                    f"{Path(pending.input_path).name}; close it once idb_list "
+                    f"shows it ready."
+                )
+            }
         return sup.close_session(database, save=save)
     except Exception as e:
         return {"error": str(e)}
@@ -1401,6 +1569,36 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
             request_id,
             _call_tool_result({"error": _DATABASE_REQUIRED_ERROR}, is_error=True),
         )
+    pending = sup.find_pending(database)
+    if pending is not None:
+        if not pending.done.is_set():
+            return _jsonrpc_result(
+                request_id,
+                _call_tool_result(
+                    {
+                        "error": (
+                            f"Session '{database}' is still analyzing "
+                            f"{Path(pending.input_path).name} "
+                            f"({round(pending.elapsed())}s so far). Retry later; "
+                            f"idb_list shows when it is ready."
+                        ),
+                        "pending": True,
+                    },
+                    is_error=True,
+                ),
+            )
+        sup.forget_pending(pending)
+        if pending.error is not None:
+            return _jsonrpc_result(
+                request_id,
+                _call_tool_result(
+                    {"error": f"Opening session '{database}' failed: {pending.error}"},
+                    is_error=True,
+                ),
+            )
+        if pending.session is not None and pending.session.session_id != database:
+            # The file was already open under another session ID.
+            database = pending.session.session_id
     try:
         session = sup.resolve_session(database)
     except Exception as e:
@@ -1509,9 +1707,9 @@ def main() -> None:
     parser.add_argument(
         "--idle-timeout",
         type=int,
-        default=os.environ.get("IDA_MCP_IDLE_TIMEOUT", "600"),
+        default=_default_idle_ttl(),
         metavar="SECONDS",
-        help="Idle timeout for a new worker opened from the initial input path (0 = disabled, default: 600).",
+        help="Idle timeout for a new worker opened from the initial input path (0 = disabled, default: IDA_MCP_IDLE_TIMEOUT or 7200).",
     )
     parser.add_argument("input_path", type=Path, nargs="?", help="Optional binary to open on startup.")
     args = parser.parse_args()

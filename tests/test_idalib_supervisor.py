@@ -588,13 +588,13 @@ def test_open_session_defaults_idle_ttl_sec_to_baseline(tmp_path):
     sup = _FakeSupervisor()
     sup.open_session(str(sample), session_id="sample")
     args = sup.opened[0][1]
-    assert args["idle_ttl_sec"] == 600
+    assert args["idle_ttl_sec"] == 7200
 
 
 @pytest.mark.parametrize(
     ("extra_args", "environment", "expected_timeout"),
     [
-        ([], {}, 600),
+        ([], {}, 7200),
         (["--idle-timeout", "0"], {}, 0),
         ([], {"IDA_MCP_IDLE_TIMEOUT": "1800"}, 1800),
         (["--idle-timeout", "0"], {"IDA_MCP_IDLE_TIMEOUT": "1800"}, 0),

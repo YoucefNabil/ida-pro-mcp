@@ -21,6 +21,7 @@ Base: upstream `c133c38` (2026-09-26).
 - `rename(func=...)` rejects an address inside a function (it used to rename the containing function). `containing=true` allows it.
 - `idb_open` returns `pending=true` with the session ID after `IDA_MCP_OPEN_WAIT` seconds (default 20) while analysis continues. Calls on a pending session say "still analyzing"; `idb_list` shows it.
 - Workers idle for `IDA_MCP_IDLE_TIMEOUT` seconds (default 7200, was 600) before exiting.
+- With `--unsafe`, the first script tool call (`py_eval`, `exec_idapython`, `py_exec_file`) in a session first saves a copy of the database to `<idb folder>/ida-mcp-backups/<name>.<timestamp>.i64`. If the save fails, the script doesn't run. `IDA_MCP_SCRIPT_BACKUP=0` turns the backup off, and `IDA_MCP_SCRIPT_BACKUP_KEEP` sets how many copies to keep per database (default 5).
 - `analyze_component` no longer fails on an address outside any function (regression from #555).
 - Windows-safe liveness check in `tests/test_idalib_close.py`; `find_bytes` wildcard test.
 

@@ -102,6 +102,14 @@ WORKER_OPEN_TIMEOUT_SEC = _env_float("IDA_MCP_OPEN_TIMEOUT", 1800.0)
 # 0 waits for the open to finish, however long it takes.
 OPEN_WAIT_SEC = _env_float("IDA_MCP_OPEN_WAIT", 20.0)
 
+# Script tools run arbitrary IDAPython, so a script can damage a database
+# without any error. Before the first one in each session, a compressed copy
+# of the database is saved to <idb dir>/ida-mcp-backups/. The open database
+# and its later saves are untouched. IDA_MCP_SCRIPT_BACKUP=0 turns this off;
+# IDA_MCP_SCRIPT_BACKUP_KEEP sets how many copies to keep per database.
+SCRIPT_TOOLS = {"py_eval", "exec_idapython", "py_exec_file"}
+SCRIPT_BACKUP_DIRNAME = "ida-mcp-backups"
+
 # Idle time before a headless worker exits. Two hours, so a session survives
 # long breaks between IDA calls (in-game testing). 0 disables the timeout.
 def _default_idle_ttl() -> int:
@@ -211,6 +219,7 @@ class WorkerSession:
     pid: int | None = None
     last_warmup: dict[str, Any] | None = None
     unresponsive_since: float | None = None
+    script_backup: str | None = None
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -1166,6 +1175,60 @@ class IdalibSupervisor:
             return session
 
     # ------------------------------------------------------------------
+    # Backups before scripts
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _idb_path_for(input_path: str) -> Path:
+        path = Path(input_path)
+        if path.suffix.lower() in (".i64", ".idb"):
+            return path
+        return path.with_name(path.name + ".i64")
+
+    def backup_before_script(self, session: WorkerSession) -> str | None:
+        """Save a copy of the database once per session. Returns the new backup path.
+
+        Raises RuntimeError when the copy fails, so the script doesn't run
+        without one.
+        """
+        if session.script_backup is not None:
+            return None
+        if os.environ.get("IDA_MCP_SCRIPT_BACKUP", "").strip() == "0":
+            session.script_backup = ""
+            return None
+        idb = self._idb_path_for(session.input_path)
+        folder = idb.parent / SCRIPT_BACKUP_DIRNAME
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = folder / f"{idb.stem}.{stamp}{idb.suffix}"
+        try:
+            folder.mkdir(exist_ok=True)
+            result = self.call_worker_tool(
+                session,
+                "idb_save",
+                {"path": str(target)},
+                timeout=WORKER_CALL_TIMEOUT_SEC or None,
+            )
+        except Exception as e:
+            raise RuntimeError(f"backup to {target} failed: {e}") from None
+        if not (isinstance(result, dict) and result.get("ok")) or not target.exists():
+            error = result.get("error") if isinstance(result, dict) else result
+            raise RuntimeError(f"backup to {target} failed: {error}")
+        session.script_backup = str(target)
+        self._prune_script_backups(folder, idb)
+        logger.info("Saved %s before the first script in session %s", target, session.session_id)
+        return str(target)
+
+    @staticmethod
+    def _prune_script_backups(folder: Path, idb: Path) -> None:
+        keep = max(1, _env_int("IDA_MCP_SCRIPT_BACKUP_KEEP", 5))
+        copies = sorted(folder.glob(f"{idb.stem}.*{idb.suffix}"), key=lambda p: p.name)
+        for old in copies[:-keep]:
+            try:
+                old.unlink()
+            except OSError:
+                logger.debug("Could not remove old backup %s", old, exc_info=True)
+
+    # ------------------------------------------------------------------
     # Background opens
     # ------------------------------------------------------------------
 
@@ -1604,12 +1667,40 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
     except Exception as e:
         return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
 
+    backup = None
+    if tool_name in SCRIPT_TOOLS:
+        try:
+            backup = sup.backup_before_script(session)
+        except Exception as e:
+            return _jsonrpc_result(
+                request_id,
+                _call_tool_result(
+                    {
+                        "error": (
+                            f"Script not run: {e}. Fix the backup, or set "
+                            f"IDA_MCP_SCRIPT_BACKUP=0 to run scripts without one."
+                        )
+                    },
+                    is_error=True,
+                ),
+            )
+
     forwarded = copy.deepcopy(request_obj)
     forwarded.setdefault("params", {})["arguments"] = arguments
     try:
-        return sup._worker_rpc(
+        response = sup._worker_rpc(
             session, forwarded, timeout=WORKER_CALL_TIMEOUT_SEC or None
         )
+        if backup:
+            content = (response.get("result") or {}).get("content")
+            if isinstance(content, list):
+                content.append(
+                    {
+                        "type": "text",
+                        "text": f"Database backed up before this session's first script: {backup}",
+                    }
+                )
+        return response
     except socket.timeout:
         return _jsonrpc_result(
             request_id,

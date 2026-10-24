@@ -111,8 +111,15 @@ class AsmPatchOp(TypedDict):
 class FunctionRename(TypedDict):
     """Function rename operation"""
 
-    addr: Annotated[str, "Function address (hex or decimal)"]
+    addr: Annotated[str, "Function start address (hex or decimal)"]
     name: Annotated[str, "New function name"]
+    containing: NotRequired[
+        Annotated[
+            bool,
+            "Allow an address inside a function and rename the function that "
+            "contains it (default: false, which rejects non-start addresses)",
+        ]
+    ]
 
 
 class GlobalRename(TypedDict):

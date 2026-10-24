@@ -520,6 +520,26 @@ def rename(
                         break
                     continue
 
+                # An address inside a function used to rename the whole
+                # containing function and still report success.
+                if func.start_ea != ea and not item.get("containing", False):
+                    owner = idaapi.get_name(func.start_ea) or hex(func.start_ea)
+                    result = {
+                        "addr": addr_text,
+                        "name": new_name,
+                        "error": (
+                            f"{hex(ea)} is inside {owner} (starts at "
+                            f"{hex(func.start_ea)}), not at a function start. "
+                            "Pass the start address, define a function here "
+                            "first (define_func), or set containing=true."
+                        ),
+                    }
+                    results.append(result)
+                    if stop_on_error:
+                        halted = True
+                        break
+                    continue
+
                 old_name = idaapi.get_name(func.start_ea) or None
                 had_user_name = _has_user_name(func.start_ea)
                 success, error = _set_name_checked(func.start_ea, str(new_name))

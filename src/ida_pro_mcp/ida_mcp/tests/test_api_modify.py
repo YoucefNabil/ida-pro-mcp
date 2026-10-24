@@ -462,6 +462,30 @@ def test_rename_function_same_name_is_stable():
 
 
 @test(binary="typed_fixture.elf")
+def test_rename_function_inside_body_is_rejected():
+    """rename(func=...) at an address inside a function errors instead of renaming its owner."""
+    import idaapi
+
+    func = idaapi.get_func(0x1013EF0)
+    if not func or func.end_ea - func.start_ea < 2:
+        skip_test("typed_fixture main function not present")
+    inner = hex(idaapi.next_head(func.start_ea, func.end_ea))
+
+    result = rename({"func": [{"addr": inner, "name": "__test_inner__"}]})
+    assert_error(result["func"][0], contains="not at a function start")
+    assert idaapi.get_name(func.start_ea) == "main"
+
+    try:
+        result = rename(
+            {"func": [{"addr": inner, "name": "__test_inner__", "containing": True}]}
+        )
+        assert "error" not in result["func"][0]
+        assert idaapi.get_name(func.start_ea) == "__test_inner__"
+    finally:
+        rename({"func": [{"addr": hex(func.start_ea), "name": "main"}]})
+
+
+@test(binary="typed_fixture.elf")
 def test_undefine_single_byte_and_restore():
     """undefine(size=1) works on code bytes and the function can be fully restored afterwards."""
     import idaapi

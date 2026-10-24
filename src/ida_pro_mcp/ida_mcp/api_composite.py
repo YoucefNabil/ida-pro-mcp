@@ -345,6 +345,10 @@ def analyze_component(
     nodes = [hex(ea) for ea in ea_set]
     edges: list[dict] = []
     for ea in ea_set:
+        # get_callees raises for an address outside any function; that
+        # address already has its error entry in `functions`.
+        if idaapi.get_func(ea) is None:
+            continue
         for callee in (get_callees(hex(ea)) or []):
             callee_ea = callee.get("addr")
             if isinstance(callee_ea, str):

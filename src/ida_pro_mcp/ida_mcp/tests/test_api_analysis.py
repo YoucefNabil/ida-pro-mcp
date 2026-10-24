@@ -681,6 +681,29 @@ def test_find_bytes_matches_known_call_opcode_sequence():
         assert_valid_address(addr)
 
 
+@test()
+def test_find_bytes_wildcard_matches_function_start():
+    """find_bytes with ?? wildcards (single and paired) finds a function's own prologue."""
+    import ida_bytes
+
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    ea = int(fn_addr, 16)
+    raw = ida_bytes.get_bytes(ea, 6)
+    if not raw or len(raw) < 6:
+        skip_test("function too short")
+    hexes = [f"{b:02X}" for b in raw]
+    for pattern in (
+        " ".join([hexes[0], "??", *hexes[2:]]),
+        " ".join([hexes[0], "?", *hexes[2:]]),
+        " ".join([hexes[0], "??", "??", *hexes[3:]]),
+    ):
+        entry = find_bytes(pattern, limit=10000)[0]
+        assert "error" not in entry or not entry["error"], entry
+        assert hex(ea) in entry["matches"], (pattern, entry)
+
+
 @test(binary="crackme03.elf")
 def test_basic_blocks_main_matches_known_cfg_shape():
     """basic_blocks(main) returns the known crackme CFG entry block and block count."""

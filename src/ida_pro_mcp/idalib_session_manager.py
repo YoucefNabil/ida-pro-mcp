@@ -17,6 +17,7 @@ import idapro
 import ida_auto
 
 from .ida_mcp.api_core import invalidate_strings_cache
+from .idalib_args import idalib_open_args
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +174,7 @@ class IDASessionManager:
     def _activate_database_path(self, input_path: str, run_auto_analysis: bool) -> None:
         self._close_active_database()
 
-        if idapro.open_database(input_path, run_auto_analysis=run_auto_analysis):
+        if idapro.open_database(input_path, run_auto_analysis=run_auto_analysis, args=idalib_open_args()):
             raise RuntimeError(f"Failed to open database: {input_path}")
 
     def discard_on_close(self) -> None:

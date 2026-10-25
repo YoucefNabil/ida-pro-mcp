@@ -2,7 +2,7 @@ from typing import Annotated, TypedDict, NotRequired
 import idaapi
 from .rpc import tool
 from .sync import idasync
-from .utils import parse_address
+from .utils import parse_address, segment_at
 
 
 class RelocationDeltaResult(TypedDict):
@@ -194,12 +194,12 @@ def convert_runtime_to_ida(
     # Enrich with segment and function context
     try:
         refs = []
-        seg = idaapi.getseg(ida_ea)
+        seg = segment_at(ida_ea)
         if seg:
             refs.append({
                 "addr": hex(ida_ea),
-                "segment": idaapi.get_segm_name(seg),
-                "permissions": f"{'r' if seg.perm & 4 else ''}{'w' if seg.perm & 2 else ''}{'x' if seg.perm & 1 else ''}",
+                "segment": seg.get_name(),
+                "permissions": f"{'r' if seg.get_perm() & 4 else ''}{'w' if seg.get_perm() & 2 else ''}{'x' if seg.get_perm() & 1 else ''}",
             })
         func = idaapi.get_func(ida_ea)
         if func:

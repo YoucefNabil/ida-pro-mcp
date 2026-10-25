@@ -518,11 +518,12 @@ def get_first_segment() -> Optional[tuple[str, str]]:
 
     Must be called from within IDA context.
     """
-    import idaapi
     import idautils
 
+    from .utils import segment_at
+
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
+        seg = segment_at(seg_ea)
         if seg:
             return (hex(seg.start_ea), hex(seg.end_ea))
     return None
@@ -536,9 +537,11 @@ def get_data_address() -> Optional[str]:
     import idaapi
     import idautils
 
+    from .utils import segment_at
+
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
-        if seg and not (seg.perm & idaapi.SEGPERM_EXEC):
+        seg = segment_at(seg_ea)
+        if seg and not (seg.get_perm() & idaapi.SEGPERM_EXEC):
             # Return first address in non-executable segment
             return hex(seg.start_ea)
     return None

@@ -7,7 +7,6 @@ Use tools for actions that modify state or perform expensive computations.
 from typing import Annotated
 
 import ida_nalt
-import ida_segment
 import ida_typeinf
 import idaapi
 import idautils
@@ -16,6 +15,7 @@ import idc
 from .rpc import resource
 from .sync import idasync
 from .utils import (
+    segment_at,
     Metadata,
     Segment,
     StructureDefinition,
@@ -73,19 +73,19 @@ def idb_segments_resource() -> list[Segment]:
     """Get all memory segments with permissions"""
     segments = []
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
+        seg = segment_at(seg_ea)
         if seg:
             perms = []
-            if seg.perm & idaapi.SEGPERM_READ:
+            if seg.get_perm() & idaapi.SEGPERM_READ:
                 perms.append("r")
-            if seg.perm & idaapi.SEGPERM_WRITE:
+            if seg.get_perm() & idaapi.SEGPERM_WRITE:
                 perms.append("w")
-            if seg.perm & idaapi.SEGPERM_EXEC:
+            if seg.get_perm() & idaapi.SEGPERM_EXEC:
                 perms.append("x")
 
             segments.append(
                 Segment(
-                    name=ida_segment.get_segm_name(seg),
+                    name=seg.get_name(),
                     start=hex(seg.start_ea),
                     end=hex(seg.end_ea),
                     size=hex(seg.size()),

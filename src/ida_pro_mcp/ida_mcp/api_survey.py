@@ -11,7 +11,7 @@ from .rpc import tool
 from .sync import idasync, tool_timeout
 from . import compat
 from .api_core import _get_strings_cache
-from .utils import get_image_size
+from .utils import get_image_size, segment_at
 
 
 class SurveyMetadata(TypedDict):
@@ -156,22 +156,21 @@ def _build_metadata() -> dict:
 def _build_segments() -> list[dict]:
     import idaapi
     import idautils
-    import ida_segment
 
     segments = []
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
+        seg = segment_at(seg_ea)
         if not seg:
             continue
         perms = []
-        if seg.perm & idaapi.SEGPERM_READ:
+        if seg.get_perm() & idaapi.SEGPERM_READ:
             perms.append("r")
-        if seg.perm & idaapi.SEGPERM_WRITE:
+        if seg.get_perm() & idaapi.SEGPERM_WRITE:
             perms.append("w")
-        if seg.perm & idaapi.SEGPERM_EXEC:
+        if seg.get_perm() & idaapi.SEGPERM_EXEC:
             perms.append("x")
         segments.append({
-            "name": ida_segment.get_segm_name(seg),
+            "name": seg.get_name(),
             "start": hex(seg.start_ea),
             "end": hex(seg.end_ea),
             "size": hex(seg.size()),

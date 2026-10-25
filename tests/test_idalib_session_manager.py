@@ -19,9 +19,11 @@ class _FakeIdapro(types.ModuleType):
         super().__init__("idapro")
         self.events: list[tuple] = []
         self.close_saves: list[bool] = []
+        self.open_args: list = []
 
-    def open_database(self, path, run_auto_analysis=False):
+    def open_database(self, path, run_auto_analysis=False, args=None):
         self.events.append(("open", path))
+        self.open_args.append(args)
         return 0  # 0 == success; the manager treats a truthy return as failure
 
     def close_database(self, save=True):
@@ -167,3 +169,21 @@ def test_discard_on_close_closes_without_saving(session_env, tmp_path):
     session_env.manager.close_all_sessions()
 
     assert session_env.idapro.close_saves == [False]
+
+
+@pytest.mark.parametrize(
+    "env, expected",
+    [
+        (None, "-dENABLE_INDEXER=YES"),
+        ("1", "-dENABLE_INDEXER=YES"),
+        ("0", None),
+        ("off", None),
+    ],
+)
+def test_open_enables_indexer(session_env, tmp_path, monkeypatch, env, expected):
+    if env is None:
+        monkeypatch.delenv("IDA_MCP_INDEXER", raising=False)
+    else:
+        monkeypatch.setenv("IDA_MCP_INDEXER", env)
+    session_env.manager.open_binary(_make_binary(tmp_path, "a.bin"), run_auto_analysis=False)
+    assert session_env.idapro.open_args == [expected]

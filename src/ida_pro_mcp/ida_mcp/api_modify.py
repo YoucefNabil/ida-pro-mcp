@@ -23,6 +23,7 @@ from .utils import (
     CommentOp,
     CommentAppendOp,
     AsmPatchOp,
+    FunctionFolderOp,
     FunctionRename,
     GlobalRename,
     LocalRename,
@@ -84,6 +85,28 @@ class RenameResult(TypedDict, total=False):
     local: list[RenameItemResult]
     stack: list[RenameItemResult]
     summary: RenameSummaryResult
+
+
+class OrganizeFunctionResult(TypedDict, total=False):
+    addr: str
+    ea: str
+    name: str
+    folder: str
+    created: bool
+    dry_run: bool
+    error: str
+
+
+class OrganizeFunctionsSummary(TypedDict, total=False):
+    total: int
+    ok: int
+    failed: int
+    dry_run: bool
+
+
+class OrganizeFunctionsResult(TypedDict):
+    results: list[OrganizeFunctionResult]
+    summary: OrganizeFunctionsSummary
 
 
 class DefineResult(TypedDict, total=False):
@@ -196,7 +219,7 @@ def set_comments(items: list[CommentOp] | CommentOp) -> list[CommentResult]:
                 continue
 
             if ea == cfunc.entry_ea:
-                idc.set_func_cmt(ea, comment, True)
+                ida_funcs.set_func_cmt_ea(ea, comment, True)
                 cfunc.refresh_func_ctext()
                 results.append({"addr": addr_str})
                 continue
@@ -274,12 +297,12 @@ def append_comments(
                     results.append({"addr": addr_str, "error": f"No function found at {hex(ea)}"})
                     continue
                 target_ea = fn.start_ea
-                current = idc.get_func_cmt(target_ea, False) or ""
+                current = ida_funcs.get_func_cmt_ea(target_ea, False) or ""
                 new_comment, skipped = _append_comment_text(current, comment, dedupe=dedupe)
                 if skipped:
                     results.append({"addr": addr_str, "scope": "func", "skipped": True})
                     continue
-                if not idc.set_func_cmt(target_ea, new_comment, False):
+                if not ida_funcs.set_func_cmt_ea(target_ea, new_comment, False):
                     results.append(
                         {
                             "addr": addr_str,
@@ -764,7 +787,7 @@ def rename(
                     continue
 
                 frame_tif = ida_typeinf.tinfo_t()
-                if not ida_frame.get_func_frame(frame_tif, func):
+                if not ida_frame.get_func_frame_ea(frame_tif, func.start_ea):
                     result = {
                         "func_addr": func_addr,
                         "old": old_name,
@@ -808,7 +831,7 @@ def rename(
                 udm = ida_typeinf.udm_t()
                 frame_tif.get_udm_by_tid(udm, tid)
                 offset = udm.offset // 8
-                if ida_frame.is_funcarg_off(func, offset):
+                if ida_frame.is_funcarg_off_ea(func.start_ea, offset):
                     result = {
                         "func_addr": func_addr,
                         "old": old_name,
@@ -829,8 +852,8 @@ def rename(
                         success = False
                         error = f"Stack variable name {new_name!r} already exists"
                     else:
-                        sval = ida_frame.soff_to_fpoff(func, offset)
-                        success = ida_frame.define_stkvar(func, new_name, sval, udm.type)
+                        sval = ida_frame.soff_to_fpoff_ea(func.start_ea, offset)
+                        success = ida_frame.define_stkvar_ea(func.start_ea, new_name, sval, udm.type)
                         if not success:
                             error = (
                                 f"Rename failed: could not rename stack variable "
@@ -932,6 +955,211 @@ def rename(
         summary["stopped_at"] = stopped_at
     result["summary"] = summary
     return result
+
+
+def _normalize_folder_path(path: str) -> str:
+    folder = str(path or "").strip().replace("\\", "/")
+    if not folder:
+        raise ValueError("Folder path is required")
+    if folder in {".", "/"}:
+        return "/"
+
+    parts = [part for part in folder.split("/") if part]
+    if not parts:
+        return "/"
+    return "/" + "/".join(parts) + "/"
+
+
+def _dirtree_error(tree: Any, err: int) -> str:
+    try:
+        text = tree.errstr(err)
+    except Exception:
+        text = ""
+    return text or f"dirtree error {err}"
+
+
+def _ensure_function_folder(tree: Any, folder: str, create_missing: bool) -> tuple[bool, bool, str | None]:
+    if folder == "/" or tree.isdir(folder):
+        return True, False, None
+
+    if not create_missing:
+        return False, False, f"Folder does not exist: {folder}"
+
+    created = False
+    current = "/"
+    for part in [part for part in folder.split("/") if part]:
+        current = f"{current}{part}/"
+        if tree.isdir(current):
+            continue
+        err = tree.mkdir(current)
+        if err not in (ida_dirtree.DTE_OK, ida_dirtree.DTE_ALREADY_EXISTS):
+            return False, created, f"mkdir {current!r} failed: {_dirtree_error(tree, err)}"
+        created = True
+    return True, created, None
+
+
+def _move_function_to_folder(tree: Any, ea: int, folder: str) -> str | None:
+    de = ida_dirtree.direntry_t()
+    de.idx = ea
+    de.isdir = False
+    cursor = tree.find_entry(de)
+    if cursor.valid():
+        # dirtree_t.bulk_move is missing from the Python bindings before IDA 9.2
+        old_path = tree.get_abspath(cursor)
+        new_path = folder + old_path.rsplit("/", 1)[-1]
+        if old_path == new_path:
+            return None
+        err = tree.rename(old_path, new_path)
+        if err == ida_dirtree.DTE_OK:
+            return None
+
+    old_cwd = tree.getcwd()
+    try:
+        err = tree.chdir(folder)
+        if err != ida_dirtree.DTE_OK:
+            return f"chdir {folder!r} failed: {_dirtree_error(tree, err)}"
+        err = tree.link(ea)
+        if err not in (ida_dirtree.DTE_OK, ida_dirtree.DTE_ALREADY_EXISTS):
+            return f"link failed: {_dirtree_error(tree, err)}"
+        return None
+    finally:
+        if old_cwd:
+            tree.chdir(old_cwd)
+
+
+@tool
+@idasync
+def organize_functions(
+    items: Annotated[
+        list[FunctionFolderOp] | FunctionFolderOp,
+        "Function folder operations: {addr, folder, create_missing?, dry_run?}",
+    ],
+) -> OrganizeFunctionsResult:
+    """Move functions into IDA function folders, creating folders by default."""
+    if isinstance(items, dict):
+        items = [items]
+
+    normalized_items = [item for item in items if isinstance(item, dict)]
+    results: list[OrganizeFunctionResult] = []
+    any_dry_run = False
+    changed = False
+
+    tree = ida_dirtree.get_std_dirtree(ida_dirtree.DIRTREE_FUNCS)
+    if tree is None:
+        for item in normalized_items:
+            results.append(
+                {
+                    "addr": str(item.get("addr", "")),
+                    "folder": str(item.get("folder", "")),
+                    "error": "Function dirtree not available",
+                }
+            )
+        return {
+            "results": results,
+            "summary": {
+                "total": len(results),
+                "ok": 0,
+                "failed": len(results),
+            },
+        }
+
+    if not tree.load():
+        for item in normalized_items:
+            results.append(
+                {
+                    "addr": str(item.get("addr", "")),
+                    "folder": str(item.get("folder", "")),
+                    "error": "Failed to load function dirtree",
+                }
+            )
+        return {
+            "results": results,
+            "summary": {
+                "total": len(results),
+                "ok": 0,
+                "failed": len(results),
+            },
+        }
+
+    for item in normalized_items:
+        addr_text = str(item.get("addr", "") or "")
+        folder_text = str(item.get("folder", "") or "")
+        dry_run = bool(item.get("dry_run", False))
+        create_missing = bool(item.get("create_missing", True))
+        any_dry_run = any_dry_run or dry_run
+
+        try:
+            folder = _normalize_folder_path(folder_text)
+        except Exception as e:
+            results.append({"addr": addr_text, "folder": folder_text, "error": str(e)})
+            continue
+
+        try:
+            ea = parse_address(addr_text)
+            func = ida_funcs.get_func(ea)
+            if func is None:
+                results.append(
+                    {
+                        "addr": addr_text,
+                        "folder": folder,
+                        "error": "Function not found",
+                    }
+                )
+                continue
+
+            start_ea = func.start_ea
+            result: OrganizeFunctionResult = {
+                "addr": addr_text,
+                "ea": hex(start_ea),
+                "name": ida_funcs.get_func_name(start_ea) or "",
+                "folder": folder,
+            }
+
+            if dry_run:
+                if not create_missing and folder != "/" and not tree.isdir(folder):
+                    result["error"] = f"Folder does not exist: {folder}"
+                else:
+                    result["dry_run"] = True
+                results.append(result)
+                continue
+
+            ok, created, error = _ensure_function_folder(tree, folder, create_missing)
+            if created:
+                result["created"] = True
+            if error:
+                result["error"] = error
+                results.append(result)
+                continue
+            if not ok:
+                result["error"] = f"Failed to prepare folder: {folder}"
+                results.append(result)
+                continue
+
+            error = _move_function_to_folder(tree, start_ea, folder)
+            if error:
+                result["error"] = error
+            else:
+                changed = True
+            results.append(result)
+        except Exception as e:
+            results.append({"addr": addr_text, "folder": folder, "error": str(e)})
+
+    if changed and not tree.save():
+        for result in results:
+            if "error" not in result and not result.get("dry_run"):
+                result["error"] = "Failed to save function dirtree"
+
+    total = len(results)
+    failed = sum(1 for result in results if "error" in result)
+    summary: OrganizeFunctionsSummary = {
+        "total": total,
+        "ok": total - failed,
+        "failed": failed,
+    }
+    if any_dry_run:
+        summary["dry_run"] = True
+
+    return {"results": results, "summary": summary}
 
 
 @tool
@@ -1360,5 +1588,114 @@ def make_data(
             })
         except Exception as e:
             results.append({"addr": addr_str, "ok": False, "error": str(e)})
+
+    return results
+
+
+# ============================================================================
+# Ignore Micro (Skippable Instructions)
+# ============================================================================
+
+
+class IgnoreMicroOp(TypedDict):
+    addr: str
+    im_type: str
+
+
+class IgnoreMicroResult(TypedDict, total=False):
+    addr: str
+    previous: str
+    current: str
+    restore_to: str
+    warning: str
+    error: str
+
+
+@tool
+@idasync
+def set_ignore_micro(
+    ops: Annotated[
+        list[IgnoreMicroOp],
+        "List of {addr, im_type} to set. "
+        "im_type: 'none' to clear, 'prolog', 'epilog', or 'switch' to mark.",
+    ],
+) -> list[IgnoreMicroResult]:
+    """Set or clear the ignore_micro (skippable instruction) flag for one or more addresses.
+
+    The decompiler skips instructions marked 'prolog', 'epilog' or 'switch'.
+    Use 'none' to clear a wrong mark so the instruction is decompiled.
+
+    The first change saves the original value in a comment
+    ('[ida-mcp: restore ignore_micro to <type>]'). To undo, read that comment
+    with disasm() and set im_type to its <type>; do not assume 'none'. The
+    comment is removed once restored. Re-decompile afterwards.
+    """
+    from .utils import (
+        IM_FROM_STR, IM_NAMES,
+        im_get_node,
+        im_backup_comment,
+        im_remove_backup_comment,
+        im_get_backup_type,
+    )
+
+    node = im_get_node()
+    results: list[IgnoreMicroResult] = []
+
+    for op in ops:
+        addr_str = op.get("addr", "?")
+        try:
+            ea = parse_address(addr_str)
+            im_type_str = op["im_type"].strip().lower()
+            im_val = IM_FROM_STR.get(im_type_str)
+            if im_val is None:
+                results.append({
+                    "addr": f"{ea:x}",
+                    "previous": "",
+                    "current": "",
+                    "error": f"Invalid im_type '{op['im_type']}'. "
+                             f"Valid values: {', '.join(IM_FROM_STR.keys())}",
+                })
+                continue
+
+            prev = node.charval_ea(ea, 0)
+            prev_str = IM_NAMES.get(prev, "none")
+
+            existing_backup = im_get_backup_type(ea)
+            if existing_backup is None:
+                # First time modified: save the original initial state
+                if im_type_str != prev_str:
+                    im_backup_comment(ea, prev_str)
+            else:
+                # Remove backup only if restored to the original initial state
+                if im_type_str == existing_backup:
+                    im_remove_backup_comment(ea)
+
+            if im_val == 0:
+                node.chardel_ea(ea, 0)
+            else:
+                node.charset_ea(ea, im_val, 0)
+
+            result_entry: IgnoreMicroResult = {
+                "addr": f"{ea:x}",
+                "previous": prev_str,
+                "current": im_type_str,
+            }
+            remaining_backup = im_get_backup_type(ea)
+            if remaining_backup:
+                result_entry["restore_to"] = remaining_backup
+                if im_type_str != remaining_backup:
+                    result_entry["warning"] = (
+                        f"This instruction's original value was '{remaining_backup}'. "
+                        f"To restore, use set_ignore_micro with "
+                        f"im_type='{remaining_backup}', not '{im_type_str}'."
+                    )
+            results.append(result_entry)
+        except Exception as e:
+            results.append({
+                "addr": addr_str,
+                "previous": "",
+                "current": "",
+                "error": str(e),
+            })
 
     return results

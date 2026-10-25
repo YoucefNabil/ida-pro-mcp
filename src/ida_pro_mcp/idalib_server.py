@@ -62,10 +62,15 @@ class IdalibDiscardResult(TypedDict):
 
 logger = logging.getLogger(__name__)
 
+# Kept regardless of --profile, as that option's help promises.  `idb_save`
+# belongs here even though no read-only client calls it directly: the
+# supervisor invokes it internally when closing a session with save=True, so
+# pruning it silently discards the session's edits.
 IDB_MANAGEMENT_TOOLS = {
     "idb_open",
     "idb_list",
     "idb_discard",
+    "idb_save",
 }
 
 

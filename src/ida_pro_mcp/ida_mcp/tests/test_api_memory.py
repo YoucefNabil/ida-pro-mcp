@@ -22,7 +22,7 @@ from ..api_memory import (
     patch,
     put_int,
 )
-from ..utils import read_bytes_bss_safe, read_int_bss_safe
+from ..utils import read_bytes_bss_safe, read_int_bss_safe, segment_at
 
 
 CRACKME_FORMAT = "0x201f"
@@ -250,14 +250,14 @@ def _find_unloaded_addr() -> int | None:
     import idautils
 
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
+        seg = segment_at(seg_ea)
         if seg is None:
             continue
-        if seg.type == idaapi.SEG_BSS:
+        if seg.get_type() == idaapi.SEG_BSS:
             return seg.start_ea
 
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
+        seg = segment_at(seg_ea)
         if seg is None:
             continue
         if not ida_bytes.is_loaded(seg.start_ea):

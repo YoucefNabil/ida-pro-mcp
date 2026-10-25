@@ -16,6 +16,7 @@ from ..framework import (
     get_data_address,
     get_unmapped_address,
 )
+from ..utils import segment_at
 from ..api_analysis import (
     decompile,
     disasm,
@@ -508,11 +509,10 @@ def test_xrefs_to_invalid():
 def _find_address_without_xrefs() -> str | None:
     """Return a mapped address with no incoming xrefs, if one exists."""
     import ida_bytes
-    import idaapi
     import idautils
 
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
+        seg = segment_at(seg_ea)
         if seg is None:
             continue
         for head in idautils.Heads(seg.start_ea, min(seg.end_ea, seg.start_ea + 0x4000)):

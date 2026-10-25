@@ -13,7 +13,6 @@ import ida_hexrays
 import ida_kernwin
 import ida_lines
 import ida_search
-import ida_segment
 import idautils
 import ida_loader
 import ida_nalt
@@ -24,6 +23,7 @@ from .mainthread import get_pump
 from .rpc import tool
 from .sync import idasync, get_tool_deadline
 from .utils import (
+    segment_at,
     ConvertedNumber,
     EntityQuery,
     Function,
@@ -244,11 +244,11 @@ def _collect_imports() -> list[Import]:
 
 
 def _segment_name_for_ea(ea: int) -> str | None:
-    seg = idaapi.getseg(ea)
+    seg = segment_at(ea)
     if not seg:
         return None
     try:
-        return idaapi.get_segm_name(seg)
+        return seg.get_name()
     except Exception:
         return None
 
@@ -1054,10 +1054,10 @@ def _exec_segments() -> list[tuple[int, int]]:
     """Return [(start, end)] for executable segments in address order."""
     ranges: list[tuple[int, int]] = []
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
+        seg = segment_at(seg_ea)
         if not seg:
             continue
-        if not (seg.perm & idaapi.SEGPERM_EXEC):
+        if not (seg.get_perm() & idaapi.SEGPERM_EXEC):
             continue
         ranges.append((seg.start_ea, seg.end_ea))
     return ranges
@@ -1066,7 +1066,7 @@ def _exec_segments() -> list[tuple[int, int]]:
 def _all_segments() -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
+        seg = segment_at(seg_ea)
         if seg:
             ranges.append((seg.start_ea, seg.end_ea))
     return ranges
@@ -1191,9 +1191,9 @@ def search_text(
                     fname = ida_funcs.get_func_name(func.start_ea)
                     if fname:
                         entry["function"] = fname
-                seg = idaapi.getseg(head_ea)
+                seg = segment_at(head_ea)
                 if seg is not None:
-                    sname = ida_segment.get_segm_name(seg)
+                    sname = seg.get_name()
                     if sname:
                         entry["segment"] = sname
                 hits.append(entry)

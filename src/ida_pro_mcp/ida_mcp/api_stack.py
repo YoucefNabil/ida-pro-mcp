@@ -86,14 +86,26 @@ def declare_stack(
             ea = parse_address(offset)
 
             frame_tif = ida_typeinf.tinfo_t()
-            if not ida_frame.get_func_frame(frame_tif, func):
+            if not ida_frame.get_func_frame_ea(frame_tif, func.start_ea):
                 results.append(
                     {"addr": fn_addr, "name": var_name, "error": "No frame returned"}
                 )
                 continue
 
+            if not var_name or not isinstance(var_name, str):
+                results.append(
+                    {"addr": fn_addr, "name": var_name, "error": "Invalid name"}
+                )
+                continue
+
             tif = get_type_by_name(type_name)
-            if not ida_frame.define_stkvar(func, var_name, ea, tif):
+            if not tif:
+                results.append(
+                    {"addr": fn_addr, "name": var_name, "error": "Invalid type name"}
+                )
+                continue
+
+            if not ida_frame.define_stkvar_ea(func.start_ea, var_name, ea, tif):
                 results.append(
                     {"addr": fn_addr, "name": var_name, "error": "Failed to define"}
                 )
@@ -128,7 +140,7 @@ def delete_stack(
                 continue
 
             frame_tif = ida_typeinf.tinfo_t()
-            if not ida_frame.get_func_frame(frame_tif, func):
+            if not ida_frame.get_func_frame_ea(frame_tif, func.start_ea):
                 results.append(
                     {"addr": fn_addr, "name": var_name, "error": "No frame returned"}
                 )
@@ -157,10 +169,19 @@ def delete_stack(
                 continue
 
             udm = ida_typeinf.udm_t()
-            frame_tif.get_udm_by_tid(udm, tid)
+            if frame_tif.get_udm_by_tid(udm, tid) < 0:  # returns the member index, -1 on failure
+                results.append(
+                    {"addr": fn_addr, "name": var_name, "error": "Failed to get udm"}
+                )
+                continue
             offset = udm.offset // 8
             size = udm.size // 8
-            if ida_frame.is_funcarg_off(func, offset):
+            if size <= 0:
+                results.append(
+                    {"addr": fn_addr, "name": var_name, "error": "Invalid size"}
+                )
+                continue
+            if ida_frame.is_funcarg_off_ea(func.start_ea, offset):
                 results.append(
                     {
                         "addr": fn_addr,
@@ -170,7 +191,7 @@ def delete_stack(
                 )
                 continue
 
-            if not ida_frame.delete_frame_members(func, offset, offset + size):
+            if not ida_frame.delete_frame_members_ea(func.start_ea, offset, offset + size):
                 results.append(
                     {"addr": fn_addr, "name": var_name, "error": "Failed to delete"}
                 )

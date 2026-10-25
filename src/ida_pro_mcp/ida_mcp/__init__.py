@@ -19,6 +19,14 @@ import signal
 if hasattr(signal, "SIGPIPE"):
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
+# This fork uses IDA 9.4 APIs (ida_indexer, segment_info_t, *_ea frame calls).
+import re as _re
+
+import idaapi as _idaapi
+
+if tuple(int(x) for x in _re.findall(r"\d+", _idaapi.get_kernel_version())[:2]) < (9, 4):
+    raise ImportError(f"ida-pro-mcp needs IDA 9.4 or later (this is IDA {_idaapi.get_kernel_version()})")
+
 # Import infrastructure modules
 from . import rpc
 from . import sync
@@ -37,6 +45,7 @@ from . import api_resources
 from . import api_survey
 from . import api_composite
 from . import api_relocation
+from . import api_ida94
 from . import trace as trace
 from . import api_sigmaker
 
@@ -67,6 +76,7 @@ __all__ = [
     "api_survey",
     "api_composite",
     "api_relocation",
+    "api_ida94",
     "api_sigmaker",
     # Re-exported components
     "idasync",

@@ -1,5 +1,7 @@
 """Tests for api_modify API functions."""
 
+import ida_funcs
+
 from ..framework import (
     test,
     skip_test,
@@ -14,13 +16,16 @@ from ..api_modify import (
     set_comments,
     patch_asm,
     rename,
+    organize_functions,
     define_func,
     define_code,
     undefine,
     force_recompile,
     set_op_type,
     make_data,
+    set_ignore_micro,
 )
+from ..api_analysis import disasm
 from ..api_memory import get_bytes, patch
 from ..api_core import lookup_funcs
 
@@ -89,14 +94,13 @@ def test_set_comment_interior_address_roundtrip():
 @test()
 def test_append_comment_function_dedupes():
     """append_comments appends once to a function comment and skips exact duplicates."""
-    import idc
 
     fn_addr = get_any_function()
     if not fn_addr:
         skip_test("binary has no functions")
 
     addr = int(fn_addr, 16)
-    original = idc.get_func_cmt(addr, False) or ""
+    original = ida_funcs.get_func_cmt_ea(addr, False) or ""
     try:
         first = append_comments({"addr": fn_addr, "comment": "__APPEND_COMMENT__", "scope": "func"})
         second = append_comments({"addr": fn_addr, "comment": "__APPEND_COMMENT__", "scope": "func"})
@@ -106,33 +110,32 @@ def test_append_comment_function_dedupes():
         assert_is_list(second, min_length=1)
         assert "error" not in second[0]
         assert second[0].get("skipped") is True
-        updated = idc.get_func_cmt(addr, False) or ""
+        updated = ida_funcs.get_func_cmt_ea(addr, False) or ""
         assert updated.count("__APPEND_COMMENT__") == 1
     finally:
-        idc.set_func_cmt(addr, original, False)
+        ida_funcs.set_func_cmt_ea(addr, original, False)
 
 
 @test()
 def test_append_comment_function_dedupe_does_not_skip_substrings():
     """append_comments should only dedupe exact existing entries, not substrings."""
-    import idc
 
     fn_addr = get_any_function()
     if not fn_addr:
         skip_test("binary has no functions")
 
     addr = int(fn_addr, 16)
-    original = idc.get_func_cmt(addr, False) or ""
+    original = ida_funcs.get_func_cmt_ea(addr, False) or ""
     try:
-        idc.set_func_cmt(addr, "foobar", False)
+        ida_funcs.set_func_cmt_ea(addr, "foobar", False)
         result = append_comments({"addr": fn_addr, "comment": "foo", "scope": "func"})
         assert_is_list(result, min_length=1)
         assert "error" not in result[0]
         assert result[0].get("appended") is True
-        updated = idc.get_func_cmt(addr, False) or ""
+        updated = ida_funcs.get_func_cmt_ea(addr, False) or ""
         assert updated == "foobar\nfoo"
     finally:
-        idc.set_func_cmt(addr, original, False)
+        ida_funcs.set_func_cmt_ea(addr, original, False)
 
 
 @test(binary="typed_fixture.elf")
@@ -461,6 +464,68 @@ def test_rename_function_same_name_is_stable():
     assert "error" not in entry
 
 
+@test()
+def test_organize_functions_moves_function_to_created_folder():
+    """organize_functions creates a folder and moves a function into it."""
+    import ida_dirtree
+
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    folder = "/__ida_mcp_test_folder__/"
+    tree = ida_dirtree.get_std_dirtree(ida_dirtree.DIRTREE_FUNCS)
+    if tree is None or not tree.load():
+        skip_test("function dirtree not available")
+
+    try:
+        result = organize_functions({"addr": fn_addr, "folder": folder})
+        assert result["summary"]["total"] == 1
+        assert result["summary"]["ok"] == 1
+        assert result["summary"]["failed"] == 0
+        entry = result["results"][0]
+        assert "error" not in entry
+        assert entry["addr"] == fn_addr
+        assert entry["folder"] == folder
+        assert tree.isdir(folder)
+    finally:
+        organize_functions({"addr": fn_addr, "folder": "/"})
+        tree.load()
+        tree.rmdir(folder)
+        tree.save()
+
+
+@test()
+def test_organize_functions_dry_run_does_not_create_folder():
+    """organize_functions dry_run validates without mutating the function dirtree."""
+    import ida_dirtree
+
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    folder = "/__ida_mcp_dry_run_folder__/"
+    result = organize_functions({"addr": fn_addr, "folder": folder, "dry_run": True})
+    assert result["summary"]["dry_run"] is True
+    assert result["summary"]["ok"] == 1
+    entry = result["results"][0]
+    assert entry["dry_run"] is True
+    assert entry["folder"] == folder
+
+    tree = ida_dirtree.get_std_dirtree(ida_dirtree.DIRTREE_FUNCS)
+    if tree is not None and tree.load():
+        assert not tree.isdir(folder)
+
+
+@test()
+def test_organize_functions_missing_function_errors():
+    """organize_functions reports missing functions without stopping the batch."""
+    result = organize_functions({"addr": "0xdeadbeef", "folder": "/__missing__/"})
+    assert result["summary"]["total"] == 1
+    assert result["summary"]["failed"] == 1
+    assert_error(result["results"][0], contains="Function not found")
+
+
 @test(binary="typed_fixture.elf")
 def test_rename_function_inside_body_is_rejected():
     """rename(func=...) at an address inside a function errors instead of renaming its owner."""
@@ -758,3 +823,38 @@ def test_set_op_type_stroff_with_valid_struct():
     # other API-level failure.
     assert "error" not in entry or "no tid" in entry.get("error", "") or "not bind" in entry.get("error", "").lower(), \
         f"unexpected error: {entry.get('error')!r}"
+
+
+def _im_line(addr: str) -> dict:
+    lines = disasm(CRACKME_MAIN)["asm"]["lines"]
+    return next(ln for ln in lines if int(ln["addr"], 16) == int(addr, 16))
+
+
+@test(binary="crackme03.elf")
+def test_set_ignore_micro_marks_and_restores():
+    """set_ignore_micro marks an instruction, disasm shows it, and restoring clears the backup."""
+    import ida_bytes
+
+    first = "0x" + disasm(CRACKME_MAIN)["asm"]["lines"][1]["addr"]  # disasm addrs are bare hex
+    ea = int(first, 16)
+    original = _im_line(first).get("ignore_micro", "none")
+    target = "epilog" if original != "epilog" else "switch"
+    try:
+        [res] = set_ignore_micro([{"addr": first, "im_type": target}])
+        assert "error" not in res, res
+        assert res["previous"] == original and res["current"] == target
+        assert res["restore_to"] == original
+        assert _im_line(first).get("ignore_micro") == target
+        assert f"restore ignore_micro to {original}]" in (ida_bytes.get_cmt(ea, 0) or "")
+    finally:
+        [back] = set_ignore_micro([{"addr": first, "im_type": original}])
+    assert "error" not in back and "restore_to" not in back, back
+    assert _im_line(first).get("ignore_micro", "none") == original
+    assert "ida-mcp: restore" not in (ida_bytes.get_cmt(ea, 0) or "")
+
+
+@test(binary="crackme03.elf")
+def test_set_ignore_micro_rejects_bad_type():
+    """set_ignore_micro reports an unknown im_type without changing anything."""
+    [res] = set_ignore_micro([{"addr": CRACKME_MAIN, "im_type": "bogus"}])
+    assert_error(res, contains="Invalid im_type")

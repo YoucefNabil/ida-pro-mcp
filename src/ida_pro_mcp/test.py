@@ -97,7 +97,9 @@ With coverage:
 
     # Open database
     print(f"Opening database for: {args.binary}")
-    if idapro.open_database(str(args.binary), run_auto_analysis=True):
+    from ida_pro_mcp.idalib_args import idalib_open_args
+
+    if idapro.open_database(str(args.binary), run_auto_analysis=True, args=idalib_open_args()):
         print("Error: Failed to open database", file=sys.stderr)
         return 1
 

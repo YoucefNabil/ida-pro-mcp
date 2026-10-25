@@ -55,6 +55,7 @@ def test_dbg_start_reports_success_when_debugger_is_running_without_ip():
     patches = [
         _SavedAttr(api_debug, "list_breakpoints", lambda: [object()]),
         _SavedAttr(api_debug.idaapi, "start_process", lambda *_args: 1),
+        _SavedAttr(api_debug, "_running_headless", lambda: False),
         _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: True),
         _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: api_debug.ida_dbg.DSTATE_RUN),
         _SavedAttr(api_debug.ida_dbg, "get_ip_val", lambda: None),
@@ -75,6 +76,7 @@ def test_dbg_start_trusts_debugger_state_over_start_process_return():
     patches = [
         _SavedAttr(api_debug, "list_breakpoints", lambda: [object()]),
         _SavedAttr(api_debug.idaapi, "start_process", lambda *_args: -1),
+        _SavedAttr(api_debug, "_running_headless", lambda: False),
         _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: True),
         _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: api_debug.ida_dbg.DSTATE_SUSP),
         _SavedAttr(api_debug.ida_dbg, "get_ip_val", lambda: 0x401000),
@@ -113,6 +115,7 @@ def test_dbg_start_arms_batch_restore_hook_before_start_process():
         _SavedAttr(api_debug, "list_breakpoints", lambda: [object()]),
         _SavedAttr(api_debug, "_arm_dbg_start_batch_hook", fake_arm),
         _SavedAttr(api_debug.idaapi, "start_process", fake_start_process),
+        _SavedAttr(api_debug, "_running_headless", lambda: False),
         _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: True),
         _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: api_debug.ida_dbg.DSTATE_SUSP),
         _SavedAttr(api_debug.ida_dbg, "get_ip_val", lambda: 0x401000),
@@ -151,6 +154,7 @@ def test_dbg_start_arms_batch_restore_hook_with_pre_call_batch_value():
             _SavedAttr(api_debug, "_arm_dbg_start_batch_hook", fake_arm),
             _SavedAttr(api_debug, "get_pre_call_batch", fake_get_pre_call_batch),
             _SavedAttr(api_debug.idaapi, "start_process", lambda *_args: 1),
+            _SavedAttr(api_debug, "_running_headless", lambda: False),
             _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: True),
             _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: api_debug.ida_dbg.DSTATE_SUSP),
             _SavedAttr(api_debug.ida_dbg, "get_ip_val", lambda: 0x401000),
@@ -242,6 +246,7 @@ def test_dbg_start_reports_cancelled_when_start_process_returns_zero_and_state_n
     patches = [
         _SavedAttr(api_debug, "list_breakpoints", lambda: [object()]),
         _SavedAttr(api_debug.idaapi, "start_process", lambda *_args: 0),
+        _SavedAttr(api_debug, "_running_headless", lambda: False),
         _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: False),
         _SavedAttr(api_debug.ida_dbg, "wait_for_next_event", wait_for_next_event),
     ]
@@ -270,6 +275,7 @@ def test_dbg_start_briefly_waits_for_ip_but_still_succeeds_without_it():
     patches = [
         _SavedAttr(api_debug, "list_breakpoints", lambda: [object()]),
         _SavedAttr(api_debug.idaapi, "start_process", lambda *_args: 1),
+        _SavedAttr(api_debug, "_running_headless", lambda: False),
         _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: True),
         _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: api_debug.ida_dbg.DSTATE_RUN),
         _SavedAttr(api_debug.ida_dbg, "get_ip_val", lambda: None),
@@ -307,6 +313,7 @@ def test_dbg_start_briefly_waits_for_ip_and_returns_it_if_it_appears():
     patches = [
         _SavedAttr(api_debug, "list_breakpoints", lambda: [object()]),
         _SavedAttr(api_debug.idaapi, "start_process", lambda *_args: 1),
+        _SavedAttr(api_debug, "_running_headless", lambda: False),
         _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: True),
         _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: next(state_values)),
         _SavedAttr(api_debug.ida_dbg, "get_ip_val", lambda: next(ip_values)),
@@ -340,6 +347,7 @@ def test_dbg_start_waits_up_to_timeout_for_debugger_to_come_up():
     patches = [
         _SavedAttr(api_debug, "list_breakpoints", lambda: [object()]),
         _SavedAttr(api_debug.idaapi, "start_process", lambda *_args: 1),
+        _SavedAttr(api_debug, "_running_headless", lambda: False),
         _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: next(on_values)),
         _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: api_debug.ida_dbg.DSTATE_SUSP),
         _SavedAttr(api_debug.ida_dbg, "get_ip_val", lambda: 0x401000),
@@ -643,6 +651,42 @@ def test_dbg_set_bp_condition_rejects_uncompiled_condition():
                 "error": "Breakpoint condition was stored but did not compile successfully",
             }
         ]
+    finally:
+        for patch in reversed(patches):
+            patch.restore()
+
+
+@test()
+def test_dbg_start_headless_waits_for_suspend_at_entry():
+    """Under idalib nothing pumps debug events, so dbg_start must block on
+    WFNE_SUSP until the entry breakpoint hits, even when the debugger only
+    comes up during the polling loop."""
+    states = {"on": False, "state": api_debug.ida_dbg.DSTATE_RUN}
+    waits = []
+
+    def wait_for_next_event(flags, timeout):
+        waits.append((flags, timeout))
+        if timeout == api_debug._DBG_START_WAIT_POLL_MS:
+            states["on"] = True  # process comes up, still running
+        else:
+            states["state"] = api_debug.ida_dbg.DSTATE_SUSP  # entry bpt hit
+        return 1
+
+    patches = [
+        _SavedAttr(api_debug, "list_breakpoints", lambda: [object()]),
+        _SavedAttr(api_debug, "_arm_dbg_start_batch_hook", lambda restore_batch=0: None),
+        _SavedAttr(api_debug.idaapi, "start_process", lambda *_args: 1),
+        _SavedAttr(api_debug.ida_dbg, "load_debugger", lambda *_args: True),
+        _SavedAttr(api_debug, "_running_headless", lambda: True),
+        _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: states["on"]),
+        _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: states["state"]),
+        _SavedAttr(api_debug.ida_dbg, "get_ip_val", lambda: 0x401000),
+        _SavedAttr(api_debug.ida_dbg, "wait_for_next_event", wait_for_next_event),
+    ]
+    try:
+        result = api_debug.dbg_start()
+        assert result == {"started": True, "state": "suspended", "suspended": True, "ip": "0x401000"}
+        assert waits[-1] == (api_debug.ida_dbg.WFNE_SUSP, 15000), waits
     finally:
         for patch in reversed(patches):
             patch.restore()

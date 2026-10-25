@@ -9,6 +9,7 @@ This module provides comprehensive debugging functionality including:
 """
 
 import os
+import sys
 from typing import Annotated, NotRequired, TypedDict
 
 import idc
@@ -18,6 +19,7 @@ import ida_idd
 import ida_idaapi
 import ida_kernwin
 import ida_name
+import ida_nalt
 import idaapi
 
 from .rpc import tool, unsafe, ext
@@ -140,6 +142,28 @@ def _get_debug_state_result() -> DebugControlResult:
         if ip is not None:
             result["ip"] = hex(ip)
     return result
+
+
+def _running_headless() -> bool:
+    """True when running under idalib (no IDA GUI): ``is_idaq()`` is False there."""
+    try:
+        return not ida_kernwin.is_idaq()
+    except Exception:
+        return True
+
+
+def _wait_headless_suspend(timeout_ms: int = 15000) -> None:
+    """Pump debug events until the debuggee suspends (breakpoint / exit).
+
+    idalib has no UI event loop, so after start/step/continue nothing advances the
+    debugger state on its own and registers stay unreadable. Block on WFNE_SUSP so
+    the caller sees a suspended process. No-op in the GUI, where the UI drives it.
+    """
+    if _running_headless():
+        try:
+            ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, timeout_ms)
+        except Exception:
+            pass
 
 
 def dbg_ensure_active() -> "ida_idd.debugger_t":
@@ -348,6 +372,14 @@ class _DbgStartBatchHook(ida_dbg.DBG_Hooks):
 _dbg_start_batch_hook: _DbgStartBatchHook | None = None
 
 
+def _settle_headless_start(started: DebugControlResult | None) -> DebugControlResult | None:
+    """Under idalib nothing pumps debug events: wait for the entry breakpoint."""
+    if started is not None and started.get("running") and _running_headless():
+        _wait_headless_suspend()
+        started = _get_debug_start_result() or started
+    return started
+
+
 def _arm_dbg_start_batch_hook(restore_batch: int) -> None:
     """Install the batch-restore hook before start_process is invoked."""
     global _dbg_start_batch_hook
@@ -373,7 +405,9 @@ def _arm_dbg_start_batch_hook(restore_batch: int) -> None:
 def dbg_start() -> DebugControlResult:
     """Start debugger session for current target.
 
-    Requires the user to have selected a debugger (Debugger -> Select debugger)
+    Headless (idalib): uses the local debugger to launch the database's input
+    file (args from IDA_MCP_DBG_ARGS) and stops at the entry point.
+    In the IDA GUI: requires the user to have selected a debugger (Debugger -> Select debugger)
     and configured the target (executable path, arguments, attach process,
     remote host, etc.). If this call fails, do not retry repeatedly. Stop,
     explain to the user that debugging is not yet configured, and ask them
@@ -408,9 +442,24 @@ def dbg_start() -> DebugControlResult:
     # not yet been dispatched). Trust the actual debugger state instead,
     # and only consult the return code as a tiebreaker for the error
     # message when nothing ever comes up.
-    start_result = idaapi.start_process("", "", "")
+    # In the GUI the user selects a debugger + target via the Debugger menu; headless
+    # (idalib) there is no such UI, so pick the platform debugger and launch this
+    # database's own input file. Optional launch args via env IDA_MCP_DBG_ARGS. The
+    # polling below waits for the process to come up and suspend.
+    if _running_headless():
+        _dbg = "win32" if sys.platform == "win32" else ("mac" if sys.platform == "darwin" else "linux")
+        try:
+            ida_dbg.load_debugger(_dbg, 0)
+        except Exception:
+            pass
+        _path = ida_nalt.get_input_file_path() or ""
+        start_result = idaapi.start_process(
+            _path, os.environ.get("IDA_MCP_DBG_ARGS", ""), os.path.dirname(_path)
+        )
+    else:
+        start_result = idaapi.start_process("", "", "")
 
-    started = _get_debug_start_result()
+    started = _settle_headless_start(_get_debug_start_result())
     if started is not None:
         if started.get("running") and "ip" not in started:
             for _ in range(_DBG_START_IP_GRACE_POLL_COUNT):
@@ -433,7 +482,7 @@ def dbg_start() -> DebugControlResult:
         )
         started = _get_debug_start_result()
         if started is not None:
-            return started
+            return _settle_headless_start(started)
 
     if start_result == 0:
         raise IDAError(
@@ -479,6 +528,7 @@ def dbg_continue() -> DebugControlResult:
     """Resume execution in active debugger session."""
     dbg_ensure_suspended()
     if idaapi.continue_process():
+        _wait_headless_suspend()
         result = _get_debug_state_result()
         result["continued"] = True
         return result
@@ -496,6 +546,7 @@ def dbg_run_to(
     dbg_ensure_suspended()
     ea = parse_address(addr)
     if idaapi.run_to(ea):
+        _wait_headless_suspend()
         result = _get_debug_state_result()
         result["continued"] = True
         return result
@@ -510,6 +561,7 @@ def dbg_step_into() -> DebugControlResult:
     """Execute one instruction, stepping into calls."""
     dbg_ensure_suspended()
     if idaapi.step_into():
+        _wait_headless_suspend()
         result = _get_debug_state_result()
         result["continued"] = True
         return result
@@ -524,6 +576,7 @@ def dbg_step_over() -> DebugControlResult:
     """Execute one instruction, stepping over calls."""
     dbg_ensure_suspended()
     if idaapi.step_over():
+        _wait_headless_suspend()
         result = _get_debug_state_result()
         result["continued"] = True
         return result

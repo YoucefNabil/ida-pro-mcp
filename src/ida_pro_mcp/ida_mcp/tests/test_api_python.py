@@ -37,6 +37,29 @@ def test_py_eval_jupyter_style_last_expression():
 
 
 @test()
+def test_py_eval_comprehension_sees_variables():
+    """Comprehensions, lambdas and nested functions see names from the same and earlier calls."""
+    result = py_eval("k = 3\n[k * i for i in range(3)]", new_locals=True)
+    assert result["result"] == "[0, 3, 6]", result
+    result = py_eval("def f(): return k + 1\n(lambda: f())()")
+    assert result["result"] == "4", result
+    result = py_eval("sum(k for _ in range(2))")
+    assert result["result"] == "6", result
+
+
+@test()
+def test_py_eval_persists_user_names_only():
+    """Persisted names are the ones the code assigned, not the IDA helpers."""
+    from ..api_python import _persisted_locals
+
+    py_eval("a = 1\nb = 2", new_locals=True)
+    assert set(_persisted_locals) == {"a", "b"}, sorted(_persisted_locals)
+    result = py_eval("c = a + b")
+    assert result["result"] == "3", result
+    assert "idaapi" not in _persisted_locals
+
+
+@test()
 def test_py_eval_stdout_capture():
     """py_eval captures stdout separately from the result value."""
     result = py_eval('print("hello from ida")\nresult = 7')

@@ -36,6 +36,8 @@ Skipped: #551 (supervisor rewrite, +1484 lines, conflicts with the close-path ch
 - IDA 9.4 tools (`api_ida94.py`): `fuzzy_search` (ranked search over functions, names, types, segments and function comments through `ida_indexer`) and `source_files` (compilation units from debug info, or which file holds an address). Databases built by 9.3 have no compilation units until reanalysed in 9.4.
 - Deprecated IDA calls moved to the 9.4 APIs: frame calls take `func.start_ea` (`get_func_frame_ea`, `define_stkvar_ea`...), `get/set_func_cmt_ea`, `decompile_function`, and segments go through `utils.segment_at(ea)` / `segments()` (built on `segment_info_t`) in place of `getseg`. Still deprecated: `get_func()` / `func_t` (62 sites; IDA's own `idautils` uses it too) and calls made inside IDA's `idautils` / `idc`.
 - Windows-safe liveness check in `tests/test_idalib_close.py`; `find_bytes` wildcard test.
+- `py_eval` runs the code in one namespace (helpers plus persisted names), so comprehensions, lambdas and nested functions see the variables; it used to `exec` with separate globals and locals, which raised `NameError` there. Only names the code assigns persist, not the helpers.
+- Headless workers turn off Hex-Rays argument hints (`ARG_HINTS_MODE = 0`, the `a1:` labels in calls) before the first decompile (`utils._apply_headless_hexrays_config`). The IDA GUI keeps its `hexrays.cfg` setting.
 
 ## Install
 ```

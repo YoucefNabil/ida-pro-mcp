@@ -1366,10 +1366,31 @@ def compact_whitespace(line: str) -> str:
     return lead + _STRING_OR_SPACES_RE.sub(_repl, stripped)
 
 
+_headless_config_done = False
+
+
+def _apply_headless_hexrays_config() -> None:
+    """Headless workers only: no `a1:` argument hints in calls (IDA 9.4's
+    ARG_HINTS_MODE = HAHM_INLAY). They add noise to every call to an unnamed
+    function. The GUI keeps its own hexrays.cfg setting."""
+    global _headless_config_done
+    if _headless_config_done:
+        return
+    _headless_config_done = True
+    try:
+        import ida_kernwin
+
+        if not ida_kernwin.is_idaq():
+            ida_hexrays.change_hexrays_config("ARG_HINTS_MODE = 0")
+    except Exception:
+        pass  # older IDA without the setting
+
+
 def decompile_checked(addr: int):
     """Decompile a function and raise IDAError on failure (uses cache)"""
     if not ida_hexrays.init_hexrays_plugin():
         raise IDAError("Hex-Rays decompiler is not available")
+    _apply_headless_hexrays_config()
     hf = ida_hexrays.hexrays_failure_t()
     cfunc = ida_hexrays.decompile(addr, hf)
     if not cfunc:

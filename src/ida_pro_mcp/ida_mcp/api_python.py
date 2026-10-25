@@ -105,6 +105,17 @@ class PythonExecResult(TypedDict):
 _persisted_locals: dict = {}
 
 
+def _persist_user_names(namespace: dict, base: dict) -> None:
+    """Keep the names the code defined or rebound, not the IDA helpers."""
+    _persisted_locals.clear()
+    for name, value in namespace.items():
+        if name == "__builtins__":
+            continue
+        if name in base and base[name] is value:
+            continue
+        _persisted_locals[name] = value
+
+
 # ============================================================================
 # Python Evaluation
 # ============================================================================
@@ -127,8 +138,9 @@ def py_eval(
     calls stay visible. Pass new_locals=True to reset the stored namespace
     and start fresh.
 
-    Note: the globals namespace (IDA modules and helpers) is always rebuilt
-    per call; only locals persist. Jupyter-style last-expression return:
+    The code runs in a single namespace (IDA modules and helpers plus the
+    persisted names), like a module, so comprehensions, lambdas and nested
+    functions see the variables. Jupyter-style last-expression return:
     if the code ends with an expression, its value is returned in "result".
     """
     # Capture stdout/stderr
@@ -137,64 +149,56 @@ def py_eval(
     old_stdout = sys.stdout
     old_stderr = sys.stderr
 
+    base = _make_exec_globals()
+    if new_locals:
+        _persisted_locals.clear()
+    namespace = dict(base)
+    namespace.update(_persisted_locals)
+
     try:
         sys.stdout = stdout_capture
         sys.stderr = stderr_capture
 
-        exec_globals = _make_exec_globals()
-        if new_locals:
-            _persisted_locals.clear()
-        exec_globals.update(_persisted_locals)
-
         result_value = None
-        exec_locals = _persisted_locals
+
+        def last_assigned():
+            # 'result' if set, else the last name the code defined
+            _persist_user_names(namespace, base)
+            if "result" in _persisted_locals:
+                return str(_persisted_locals["result"])
+            if _persisted_locals:
+                return str(list(_persisted_locals.values())[-1])
+            return None
 
         # Parse code with AST to properly handle execution
         try:
             tree = ast.parse(code)
         except SyntaxError:
             # If parsing fails, fall back to direct exec
-            exec(code, exec_globals, exec_locals)
-            exec_globals.update(exec_locals)
-            if "result" in exec_locals:
-                result_value = str(exec_locals["result"])
-            elif exec_locals:
-                last_key = list(exec_locals.keys())[-1]
-                result_value = str(exec_locals[last_key])
+            exec(code, namespace)
+            result_value = last_assigned()
         else:
             if not tree.body:
                 # Empty code
                 pass
             elif len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
                 # Single expression - use eval
-                result_value = str(eval(code, exec_globals))
+                result_value = str(eval(code, namespace))
             elif isinstance(tree.body[-1], ast.Expr):
                 # Multiple statements, last one is an expression (Jupyter-style)
                 # Execute all statements except the last
                 if len(tree.body) > 1:
                     exec_tree = ast.Module(body=tree.body[:-1], type_ignores=[])
-                    exec(
-                        compile(exec_tree, "<string>", "exec"),
-                        exec_globals,
-                        exec_locals,
-                    )
-                    exec_globals.update(exec_locals)
+                    exec(compile(exec_tree, "<string>", "exec"), namespace)
                 # Eval only the last expression
                 eval_tree = ast.Expression(body=tree.body[-1].value)
                 result_value = str(
-                    eval(compile(eval_tree, "<string>", "eval"), exec_globals)
+                    eval(compile(eval_tree, "<string>", "eval"), namespace)
                 )
             else:
                 # All statements (no trailing expression)
-                exec(code, exec_globals, exec_locals)
-                exec_globals.update(exec_locals)
-                # Return 'result' variable if explicitly set
-                if "result" in exec_locals:
-                    result_value = str(exec_locals["result"])
-                # Return last assigned variable
-                elif exec_locals:
-                    last_key = list(exec_locals.keys())[-1]
-                    result_value = str(exec_locals[last_key])
+                exec(code, namespace)
+                result_value = last_assigned()
 
         # Collect output
         stdout_text = stdout_capture.getvalue()
@@ -215,6 +219,8 @@ def py_eval(
             "stderr": traceback.format_exc(),
         }
     finally:
+        # names assigned before an exception persist too, as before
+        _persist_user_names(namespace, base)
         sys.stdout = old_stdout
         sys.stderr = old_stderr
 
